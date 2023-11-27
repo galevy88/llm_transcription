@@ -1,0 +1,160 @@
+# Import necessary libraries
+from langchain.document_loaders import YoutubeLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.llms import OpenAI
+from langchain import PromptTemplate
+from langchain.chains import LLMChain
+from dotenv import load_dotenv
+from pytube import YouTube
+import cv2
+import os
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+nltk.download('punkt')
+nltk.download('stopwords')
+
+
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI Embeddings
+embeddings = OpenAIEmbeddings()
+
+def create_db_from_youtube_video_url(video_url: str) -> FAISS:
+    loader = YoutubeLoader.from_youtube_url(video_url)
+    transcript = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = text_splitter.split_documents(transcript)
+    db = FAISS.from_documents(docs, embeddings)
+    return db
+
+def get_response_from_query(db, query, k=4):
+    docs = db.similarity_search(query, k=k)
+    docs_page_content = " ".join([d.page_content for d in docs])
+    llm = OpenAI(model_name="gpt-3.5-turbo-0301")
+    prompt = PromptTemplate(
+        input_variables=["question", "docs"],
+        template="""
+        You are a helpful assistant that can answer questions about youtube videos 
+        based on the video's transcript.
+        
+        Answer the following question: {question}
+        By searching the following video transcript: {docs}
+        
+        Only use the factual information from the transcript to answer the question.
+        
+        If you feel like you don't have enough information to answer the question, say "I don't know".
+        
+        Your answers should be verbose and detailed.
+        """,
+    )
+    chain = LLMChain(llm=llm, prompt=prompt)
+    response = chain.run(question=query, docs=docs_page_content)
+    response = response.replace("\n", "")
+    return response, docs
+
+def extract_images_from_video(video_url: str, output_folder: str, summary: str, num_images: int = 5):
+    # Basic text processing to extract key terms from the summary
+    words = word_tokenize(summary.lower())
+    stop_words = set(stopwords.words('english'))
+    filtered_words = [word for word in words if word.isalpha() and word not in stop_words]
+
+    # Frequency distribution of words
+    freq_dist = nltk.FreqDist(filtered_words)
+    most_common_words = [word for word, freq in freq_dist.most_common(num_images)]
+
+    # Download the video
+    yt = YouTube(video_url)
+    video = yt.streams.filter(file_extension='mp4').first()
+    video.download(output_folder, filename='video.mp4')
+    
+    # Capture video
+    cap = cv2.VideoCapture(os.path.join(output_folder, 'video.mp4'))
+    length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = length / fps
+
+    # Estimate timestamps based on word frequency
+    timestamps = []
+    time_step = duration / len(most_common_words)
+    current_time = 0
+    for word in most_common_words:
+        timestamps.append(int(current_time * fps))
+        current_time += time_step
+
+    # Extract images from estimated timestamps
+    images = []
+    for timestamp in timestamps:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, timestamp)
+        ret, frame = cap.read()
+        if ret:
+            image_path = os.path.join(output_folder, f'image_{timestamp}.png')
+            cv2.imwrite(image_path, frame)
+            images.append(image_path)
+
+    cap.release()
+    return images
+
+def create_pdf_with_summary_and_images_v2(summary: str, images: list, output_file: str):
+    doc = SimpleDocTemplate(output_file, pagesize=letter)
+    story = []
+    styles = getSampleStyleSheet()
+    # Add images and text alternately
+    for image in images:
+        img = Image(image, width=460, height=200, hAlign='CENTER')
+        story.append(img)
+        story.append(Spacer(1, 12))
+    # Add summary text
+    summary_paragraphs = summary.split('\n')
+    for paragraph in summary_paragraphs:
+        p = Paragraph(paragraph, styles['Normal'])
+        story.append(p)
+        story.append(Spacer(1, 12))
+    doc.build(story)
+
+
+
+
+
+
+
+#############
+
+
+
+
+
+
+# Import necessary libraries
+import langchain_helper as lch
+import os
+
+# YouTube video URL and query
+youtube_url = "https://www.youtube.com/watch?v=Gjnup-PuquQ&t=5s"
+query = "Can you summarize for me this transcript?"
+
+# Output folder for images and PDF
+output_folder = "output"
+os.makedirs(output_folder, exist_ok=True)
+
+# Create database from YouTube video transcript
+db = lch.create_db_from_youtube_video_url(youtube_url)
+
+# Get response and documents
+response, docs = lch.get_response_from_query(db, query)
+
+
+images = lch.extract_images_from_video(youtube_url, output_folder, response)
+
+
+# Create PDF with summary and images (improved layout)
+pdf_output_file_v2 = os.path.join(output_folder, "summary_v2.pdf")
+lch.create_pdf_with_summary_and_images_v2(response, images, pdf_output_file_v2)
+
+print(f"Improved PDF created at {pdf_output_file_v2}")
